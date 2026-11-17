@@ -25,7 +25,7 @@ Không dùng database password, connection string hay `service_role` key trong f
 
 ```env
 VITE_SUPABASE_URL=https://your-project-ref.supabase.co
-VITE_SUPABASE_ANON_KEY=your-publishable-or-anon-key
+VITE_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
 VITE_SUBMIT_CONFLICT_POLICY=warn
 ```
 
