@@ -1,0 +1,39 @@
+{
+  "id": 2,
+  "jsonrpc": "2.0",
+  "result": {
+    "_meta": {
+      "ui": {
+        "resourceUri": "ui://stitch.googleapis.com/project-viewer",
+        "visibility": [
+          "model",
+          "app"
+        ]
+      }
+    },
+    "content": [
+      {
+        "text": "{\"name\":\"projects/3328629235125022198/screens/3b9d8a59c0a04b1d8c3aa72b0a04d103\",\"title\":\"Thiết bị - Kho thiết bị CLB\",\"screenshot\":{\"name\":\"projects/3328629235125022198/screens/3b9d8a59c0a04b1d8c3aa72b0a04d103/fileEntries/screenshot\",\"downloadUrl\":\"https://stitch.googleapis.com/v1/projects/3328629235125022198/files/screenshot_000660706b4ae99e053b71995636e172:download\",\"mimeType\":\"image/png\"},\"htmlCode\":{\"name\":\"projects/3328629235125022198/screens/3b9d8a59c0a04b1d8c3aa72b0a04d103/fileEntries/html\",\"downloadUrl\":\"https://stitch.googleapis.com/v1/projects/3328629235125022198/files/3b9d8a59c0a04b1d8c3aa72b0a04d103:download\",\"mimeType\":\"text/html\"},\"width\":\"2560\",\"height\":\"3332\",\"deviceType\":\"DESKTOP\",\"screenType\":\"DESIGN\"}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "deviceType": "DESKTOP",
+      "height": "3332",
+      "htmlCode": {
+        "downloadUrl": "https://stitch.googleapis.com/v1/projects/3328629235125022198/files/3b9d8a59c0a04b1d8c3aa72b0a04d103:download",
+        "mimeType": "text/html",
+        "name": "projects/3328629235125022198/screens/3b9d8a59c0a04b1d8c3aa72b0a04d103/fileEntries/html"
+      },
+      "name": "projects/3328629235125022198/screens/3b9d8a59c0a04b1d8c3aa72b0a04d103",
+      "screenType": "DESIGN",
+      "screenshot": {
+        "downloadUrl": "https://stitch.googleapis.com/v1/projects/3328629235125022198/files/screenshot_000660706b4ae99e053b71995636e172:download",
+        "mimeType": "image/png",
+        "name": "projects/3328629235125022198/screens/3b9d8a59c0a04b1d8c3aa72b0a04d103/fileEntries/screenshot"
+      },
+      "title": "Thiết bị - Kho thiết bị CLB",
+      "width": "2560"
+    }
+  }
+}
