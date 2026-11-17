@@ -1,0 +1,83 @@
+-- Kho thiết bị CLB — schema, seed, RLS và RPC. Chạy toàn bộ file trong Supabase SQL Editor.
+create extension if not exists unaccent;
+create table if not exists public.devices (
+  code text primary key check (code ~ '^TB-[0-9]+$'), name text not null check (length(trim(name)) > 0),
+  type text not null check (length(trim(type)) > 0), status text not null check (status in ('AVAILABLE','BORROWED','MAINTENANCE')),
+  note text not null default '', created_at timestamptz not null default now(), updated_at timestamptz not null default now()
+);
+create table if not exists public.requests (
+  code text primary key check (code ~ '^YC-[0-9]+$'), device_code text not null references public.devices(code),
+  borrower_name text not null check (length(trim(borrower_name)) between 2 and 60), borrow_date date not null, return_date date not null,
+  status text not null check (status in ('PENDING','APPROVED','BORROWING','RETURNED','REJECTED')), purpose text check (length(coalesce(purpose,'')) <= 300),
+  manager_note text check (length(coalesce(manager_note,'')) <= 200), returned_at timestamptz, created_at timestamptz not null default now(), updated_at timestamptz not null default now(), check(return_date >= borrow_date)
+);
+create table if not exists public.request_events (
+  id bigint generated always as identity primary key, request_code text not null references public.requests(code) on delete cascade,
+  from_status text, to_status text not null, note text, created_at timestamptz not null default now()
+);
+create index if not exists idx_requests_device_status on public.requests(device_code,status);
+create index if not exists idx_requests_dates on public.requests(borrow_date,return_date);
+
+alter table public.devices enable row level security;
+alter table public.requests enable row level security;
+alter table public.request_events enable row level security;
+revoke all on public.devices, public.requests, public.request_events from anon, authenticated;
+
+create or replace function public.to_device(d public.devices) returns jsonb language sql stable as $$
+  select jsonb_build_object('code',d.code,'name',d.name,'type',d.type,'status',d.status,'note',d.note,'createdAt',d.created_at,'updatedAt',d.updated_at);
+$$;
+create or replace function public.to_request(r public.requests) returns jsonb language sql stable as $$
+  select jsonb_build_object('code',r.code,'deviceCode',r.device_code,'deviceName',d.name,'deviceType',d.type,'borrowerName',r.borrower_name,'borrowDate',r.borrow_date,'returnDate',r.return_date,'status',r.status,'purpose',r.purpose,'managerNote',r.manager_note,'returnedAt',r.returned_at,'createdAt',r.created_at,'updatedAt',r.updated_at,'overlap',jsonb_build_object('blocking','[]'::jsonb,'competing','[]'::jsonb)) from public.devices d where d.code=r.device_code;
+$$;
+
+create or replace function public.get_devices(p_q text default '', p_status text default '', p_type text default '') returns jsonb language sql security definer set search_path=public stable as $$
+  select jsonb_build_object('items',coalesce(jsonb_agg(jsonb_build_object('code',d.code,'name',d.name,'type',d.type,'status',d.status,'note',d.note,'createdAt',d.created_at,'updatedAt',d.updated_at,'bookings',coalesce((select jsonb_agg(jsonb_build_object('requestCode',r.code,'borrowDate',r.borrow_date,'returnDate',r.return_date,'status',r.status) order by r.borrow_date) from requests r where r.device_code=d.code and r.status in ('APPROVED','BORROWING')),'[]'::jsonb)) order by d.code),'[]'::jsonb),'types',coalesce((select jsonb_agg(type order by type) from (select distinct type from devices) x),'[]'::jsonb))
+  from devices d where (p_status='' or d.status=p_status) and (p_type='' or d.type=p_type) and (p_q='' or regexp_replace(lower(translate(unaccent(d.code||' '||d.name||' '||d.type),'đ','d')),'[^a-z0-9]+','','g') like '%'||regexp_replace(lower(translate(unaccent(p_q),'đ','d')),'[^a-z0-9]+','','g')||'%');
+$$;
+
+create or replace function public.get_requests(p_q text default '', p_status text default '', p_device_code text default '') returns jsonb language sql security definer set search_path=public stable as $$
+  with filtered as (select r.* from requests r join devices d on d.code=r.device_code where (p_status='' or r.status=p_status) and (p_device_code='' or r.device_code=p_device_code) and (p_q='' or regexp_replace(lower(translate(unaccent(r.code||' '||r.borrower_name||' '||r.device_code||' '||d.name),'đ','d')),'[^a-z0-9]+','','g') like '%'||regexp_replace(lower(translate(unaccent(p_q),'đ','d')),'[^a-z0-9]+','','g')||'%') order by case r.status when 'PENDING' then 1 when 'APPROVED' then 2 when 'BORROWING' then 3 when 'RETURNED' then 4 else 5 end,r.borrow_date,r.code)
+  select jsonb_build_object('items',coalesce((select jsonb_agg(to_request(r)) from filtered r),'[]'::jsonb),'counts',jsonb_build_object('pending',(select count(*) from requests where status='PENDING'),'approved',(select count(*) from requests where status='APPROVED'),'borrowing',(select count(*) from requests where status='BORROWING'),'returned',(select count(*) from requests where status='RETURNED'),'rejected',(select count(*) from requests where status='REJECTED')));
+$$;
+
+create or replace function public.get_request_detail(p_code text) returns jsonb language plpgsql security definer set search_path=public as $$
+declare r requests%rowtype; result jsonb;
+begin select * into r from requests where code=p_code; if not found then return jsonb_build_object('error',jsonb_build_object('code','NOT_FOUND','message','Không tìm thấy yêu cầu '||p_code||'.')); end if;
+select to_request(r)||jsonb_build_object('events',coalesce(jsonb_agg(jsonb_build_object('id',e.id,'fromStatus',e.from_status,'toStatus',e.to_status,'note',e.note,'createdAt',e.created_at) order by e.id),'[]'::jsonb)) into result from request_events e where e.request_code=r.code; return result; end; $$;
+
+create or replace function public.check_availability(p_device_code text,p_borrow_date date,p_return_date date,p_exclude_code text default null) returns jsonb language plpgsql security definer set search_path=public as $$
+declare d devices%rowtype; blocking jsonb; competing jsonb;
+begin select * into d from devices where code=p_device_code; if not found then return jsonb_build_object('error',jsonb_build_object('code','NOT_FOUND','message','Không tìm thấy thiết bị '||p_device_code||'.')); end if;
+select coalesce(jsonb_agg(jsonb_build_object('requestCode',code,'borrowerName',borrower_name,'borrowDate',borrow_date,'returnDate',return_date,'status',status)),'[]'::jsonb) into blocking from requests where device_code=p_device_code and status in ('APPROVED','BORROWING') and borrow_date<=p_return_date and return_date>=p_borrow_date and (p_exclude_code is null or code<>p_exclude_code);
+select coalesce(jsonb_agg(jsonb_build_object('requestCode',code,'borrowerName',borrower_name,'borrowDate',borrow_date,'returnDate',return_date,'status',status)),'[]'::jsonb) into competing from requests where device_code=p_device_code and status='PENDING' and borrow_date<=p_return_date and return_date>=p_borrow_date and (p_exclude_code is null or code<>p_exclude_code);
+return jsonb_build_object('policy','warn','deviceStatus',d.status,'blocking',blocking,'competing',competing); end; $$;
+
+create or replace function public.create_borrow_request(p_payload jsonb,p_policy text default 'warn') returns jsonb language plpgsql security definer set search_path=public as $$
+declare v_device text:=trim(p_payload->>'deviceCode'); v_name text:=regexp_replace(trim(coalesce(p_payload->>'borrowerName','')),'\s+',' ','g'); v_borrow date; v_return date; d devices%rowtype; new_code text; r requests%rowtype; conflicts jsonb;
+begin
+  begin v_borrow:=(p_payload->>'borrowDate')::date; v_return:=(p_payload->>'returnDate')::date; exception when others then return jsonb_build_object('error',jsonb_build_object('code','VALIDATION_ERROR','message','Ngày không hợp lệ.')); end;
+  if v_device is null or v_device='' then return jsonb_build_object('error',jsonb_build_object('code','VALIDATION_ERROR','message','Dữ liệu chưa hợp lệ.','fields',jsonb_build_object('deviceCode','Vui lòng chọn thiết bị.'))); end if;
+  if length(v_name) not between 2 and 60 then return jsonb_build_object('error',jsonb_build_object('code','VALIDATION_ERROR','message','Dữ liệu chưa hợp lệ.','fields',jsonb_build_object('borrowerName','Họ tên cần từ 2 đến 60 ký tự.'))); end if;
+  if v_return<v_borrow then return jsonb_build_object('error',jsonb_build_object('code','VALIDATION_ERROR','message','Dữ liệu chưa hợp lệ.','fields',jsonb_build_object('returnDate','Ngày trả dự kiến không được trước ngày mượn.'))); end if;
+  perform pg_advisory_xact_lock(hashtext(v_device)); select * into d from devices where code=v_device; if not found then return jsonb_build_object('error',jsonb_build_object('code','NOT_FOUND','message','Không tìm thấy thiết bị '||v_device||'.')); end if;
+  if d.status='MAINTENANCE' then return jsonb_build_object('error',jsonb_build_object('code','DEVICE_UNDER_MAINTENANCE','message','Thiết bị '||d.code||' ('||d.name||') đang bảo trì nên chưa nhận đăng ký mượn.')); end if;
+  select coalesce(jsonb_agg(jsonb_build_object('requestCode',code,'borrowerName',borrower_name,'borrowDate',borrow_date,'returnDate',return_date,'status',status)),'[]'::jsonb) into conflicts from requests where device_code=v_device and status in ('APPROVED','BORROWING') and borrow_date<=v_return and return_date>=v_borrow;
+  if jsonb_array_length(conflicts)>0 and p_policy='block' then return jsonb_build_object('error',jsonb_build_object('code','SCHEDULE_CONFLICT','message','Khoảng thời gian này đã có lịch được duyệt.','details',jsonb_build_object('conflicts',conflicts))); end if;
+  select 'YC-'||coalesce(max(substring(code from 4)::int)+1,101) into new_code from requests; insert into requests(code,device_code,borrower_name,borrow_date,return_date,status,purpose) values(new_code,v_device,v_name,v_borrow,v_return,'PENDING',nullif(p_payload->>'purpose','')) returning * into r; insert into request_events(request_code,to_status) values(new_code,'PENDING');
+  return jsonb_build_object('request',to_request(r),'warnings',case when jsonb_array_length(conflicts)>0 then jsonb_build_array(jsonb_build_object('code','SCHEDULE_OVERLAP','message','Khoảng thời gian này đã có lịch được duyệt. Yêu cầu của bạn đã được gửi nhưng chỉ có thể được duyệt nếu lịch kia được giải phóng.','conflicts',conflicts)) else '[]'::jsonb end); end; $$;
+
+create or replace function public.change_request_status(p_code text,p_status text,p_note text default null) returns jsonb language plpgsql security definer set search_path=public as $$
+declare r requests%rowtype; d devices%rowtype; valid boolean; conflicts jsonb;
+begin select * into r from requests where code=p_code for update; if not found then return jsonb_build_object('error',jsonb_build_object('code','NOT_FOUND','message','Không tìm thấy yêu cầu '||p_code||'.')); end if; valid=(r.status='PENDING' and p_status in ('APPROVED','REJECTED')) or (r.status='APPROVED' and p_status in ('PENDING','BORROWING','REJECTED')) or (r.status='BORROWING' and p_status='RETURNED') or (r.status='REJECTED' and p_status='PENDING'); if not valid then return jsonb_build_object('error',jsonb_build_object('code','INVALID_STATUS_TRANSITION','message','Không thể chuyển trạng thái yêu cầu này.')); end if;
+perform pg_advisory_xact_lock(hashtext(r.device_code)); select * into d from devices where code=r.device_code; if p_status in ('APPROVED','BORROWING') and d.status='MAINTENANCE' then return jsonb_build_object('error',jsonb_build_object('code','DEVICE_UNDER_MAINTENANCE','message','Thiết bị đang bảo trì nên chưa thể duyệt hoặc giao.')); end if;
+if p_status in ('APPROVED','BORROWING') then select coalesce(jsonb_agg(jsonb_build_object('requestCode',code,'borrowerName',borrower_name,'borrowDate',borrow_date,'returnDate',return_date,'status',status)),'[]'::jsonb) into conflicts from requests where device_code=r.device_code and code<>r.code and status in ('APPROVED','BORROWING') and borrow_date<=r.return_date and return_date>=r.borrow_date; if jsonb_array_length(conflicts)>0 then return jsonb_build_object('error',jsonb_build_object('code','SCHEDULE_CONFLICT','message','Không thể duyệt '||r.code||': thiết bị đã có lịch trùng.','details',jsonb_build_object('conflicts',conflicts))); end if; end if;
+update requests set status=p_status,manager_note=coalesce(p_note,manager_note),returned_at=case when p_status='RETURNED' then now() else returned_at end,updated_at=now() where code=p_code returning * into r; if p_status='BORROWING' then update devices set status='BORROWED',updated_at=now() where code=r.device_code; elsif p_status='RETURNED' and not exists(select 1 from requests where device_code=r.device_code and status='BORROWING') then update devices set status='AVAILABLE',updated_at=now() where code=r.device_code and status='BORROWED'; end if; insert into request_events(request_code,from_status,to_status,note) values(r.code,(select status from request_events where request_code=r.code order by id desc limit 1),p_status,p_note); return jsonb_build_object('request',to_request(r)); end; $$;
+
+create or replace function public.get_stats() returns jsonb language sql security definer set search_path=public stable as $$ select jsonb_build_object('devices',jsonb_build_object('total',(select count(*) from devices),'available',(select count(*) from devices where status='AVAILABLE'),'borrowed',(select count(*) from devices where status='BORROWED'),'maintenance',(select count(*) from devices where status='MAINTENANCE')),'requests',jsonb_build_object('pending',(select count(*) from requests where status='PENDING'),'approved',(select count(*) from requests where status='APPROVED'),'borrowing',(select count(*) from requests where status='BORROWING'),'returned',(select count(*) from requests where status='RETURNED'),'rejected',(select count(*) from requests where status='REJECTED'))); $$;
+
+create or replace function public.update_device(p_code text,p_payload jsonb) returns jsonb language plpgsql security definer set search_path=public as $$ declare d devices%rowtype; begin update devices set name=coalesce(nullif(trim(p_payload->>'name'),''),name),type=coalesce(nullif(trim(p_payload->>'type'),''),type),note=coalesce(p_payload->>'note',note),status=coalesce(p_payload->>'status',status),updated_at=now() where code=p_code returning * into d; if not found then return jsonb_build_object('error',jsonb_build_object('code','NOT_FOUND','message','Không tìm thấy thiết bị '||p_code||'.')); end if; return jsonb_build_object('device',to_device(d),'affectedRequests','[]'::jsonb); end; $$;
+
+create or replace function public.reset_seed_data() returns jsonb language plpgsql security definer set search_path=public as $$ begin delete from request_events; delete from requests; delete from devices; insert into devices(code,name,type,status,note,created_at,updated_at) values ('TB-01','Máy ảnh Lumix G7','Máy ảnh','AVAILABLE','Kèm pin và thẻ nhớ','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'),('TB-02','Chân máy mini','Phụ kiện','BORROWED','Dự kiến trả ngày 22/11','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'),('TB-03','Micro USB','Âm thanh','AVAILABLE','Dùng ghi âm/phỏng vấn','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'),('TB-04','Đèn LED để bàn','Ánh sáng','MAINTENANCE','Không cho đăng ký mượn','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'),('TB-05','Tripod cao','Phụ kiện','AVAILABLE','Có túi đựng','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'); insert into requests(code,device_code,borrower_name,borrow_date,return_date,status,created_at,updated_at) values ('YC-101','TB-02','An Nguyễn','2026-11-22','2026-11-23','PENDING','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'),('YC-102','TB-03','Bình Trần','2026-11-21','2026-11-21','APPROVED','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'),('YC-103','TB-01','Chi Lê','2026-11-24','2026-11-25','BORROWING','2026-11-10T01:00:00Z','2026-11-10T01:00:00Z'); insert into request_events(request_code,to_status,created_at) values ('YC-101','PENDING','2026-11-10T01:00:00Z'),('YC-102','APPROVED','2026-11-10T01:00:00Z'),('YC-103','BORROWING','2026-11-10T01:00:00Z'); return jsonb_build_object('devices',5,'requests',3); end; $$;
+
+grant execute on function public.get_devices(text,text,text),public.get_requests(text,text,text),public.get_request_detail(text),public.check_availability(text,date,date,text),public.create_borrow_request(jsonb,text),public.change_request_status(text,text,text),public.get_stats(),public.update_device(text,jsonb),public.reset_seed_data() to anon, authenticated;
+select public.reset_seed_data();
